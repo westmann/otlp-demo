@@ -1,14 +1,6 @@
 package com.couchbase;
 
-import static java.lang.Thread.sleep;
-
-import java.io.IOException;
-import java.time.Duration;
-
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.sdk.metrics.SdkMeterProvider;
-import org.apache.commons.lang3.RandomStringUtils;
-
+import com.couchbase.client.core.cnc.RequestTracer;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMapper;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.node.ObjectNode;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.node.TextNode;
@@ -21,10 +13,23 @@ import com.couchbase.client.java.Collection;
 import com.couchbase.client.java.env.ClusterEnvironment;
 import com.couchbase.client.java.kv.GetResult;
 import com.couchbase.client.java.kv.MutationResult;
-import com.couchbase.client.metrics.opentelemetry.OpenTelemetryMeter;
+import com.couchbase.client.tracing.opentelemetry.OpenTelemetryRequestTracer;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
+import io.opentelemetry.context.propagation.ContextPropagators;
+import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.SdkTracerProviderBuilder;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.sdk.trace.samplers.Sampler;
+import org.apache.commons.lang3.RandomStringUtils;
 
-import io.opentelemetry.exporter.prometheus.PrometheusCollector;
-import io.prometheus.client.exporter.HTTPServer;
+import java.io.IOException;
+import java.time.Duration;
+
+import static java.lang.Thread.sleep;
+
 
 public class ElixirDemoWorkload {
 
@@ -37,21 +42,27 @@ public class ElixirDemoWorkload {
         CoreEnvironment coreEnv = CoreEnvironment.builder()
                 .loggingMeterConfig(LoggingMeterConfig.enabled(true).emitInterval(Duration.ofSeconds(30))).build();
 
-        // Build the OpenTelemetry Meter
-        SdkMeterProvider sdkMeterProvider = SdkMeterProvider.builder().buildAndRegisterGlobal();
-        Meter meter = sdkMeterProvider.get("OpenTelemetryMetricsSample");
+        SdkTracerProviderBuilder builder = SdkTracerProvider.builder().setSampler(Sampler.alwaysOn());
 
-        // Start the Prometheus HTTP Server
-        HTTPServer server = new HTTPServer(19090);
-        // Register the Prometheus Collector
-        PrometheusCollector.builder().setMetricProducer(sdkMeterProvider).buildAndRegister();
+        builder.addSpanProcessor(BatchSpanProcessor.builder(OtlpGrpcSpanExporter.builder()
+                .setEndpoint("http://localhost:4317")
+                .build()).build());
+        SdkTracerProvider sdkTracerProvider = builder.build();
+
+        OpenTelemetry openTelemetrySdk = OpenTelemetrySdk.builder()
+                .setTracerProvider(sdkTracerProvider)
+                .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance()))
+                .buildAndRegisterGlobal();
+
+        RequestTracer requestTracer = OpenTelemetryRequestTracer.wrap(openTelemetrySdk);
+
 
         ClusterEnvironment clusterEnv =
-                ClusterEnvironment.builder().meter(OpenTelemetryMeter.wrap(sdkMeterProvider)).build();
+                ClusterEnvironment.builder()
+                        .requestTracer(requestTracer)
+                        .build();
         System.err.println(clusterEnv);
         runWorkload(clusterEnv);
-
-        server.stop();
 
         sleep(1000);
     }
