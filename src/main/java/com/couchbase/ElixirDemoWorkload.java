@@ -5,13 +5,9 @@ import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMappe
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.node.ObjectNode;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.node.TextNode;
 import com.couchbase.client.core.env.SeedNode;
-import com.couchbase.client.java.Bucket;
-import com.couchbase.client.java.Cluster;
-import com.couchbase.client.java.ClusterOptions;
-import com.couchbase.client.java.Collection;
+import com.couchbase.client.java.*;
 import com.couchbase.client.java.env.ClusterEnvironment;
 import com.couchbase.client.java.kv.GetResult;
-import com.couchbase.client.java.kv.MutationResult;
 import com.couchbase.client.java.query.QueryResult;
 import com.couchbase.client.tracing.opentelemetry.OpenTelemetryRequestTracer;
 import io.opentelemetry.api.OpenTelemetry;
@@ -28,6 +24,7 @@ import org.apache.commons.lang3.RandomStringUtils;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.Optional;
+import java.util.concurrent.Semaphore;
 
 import static java.lang.Thread.sleep;
 
@@ -86,15 +83,12 @@ public class ElixirDemoWorkload {
     private static void runWorkload(Cluster cluster) throws InterruptedException {
         ObjectMapper mapper = new ObjectMapper();
 
-        final int records = 100;
+        final int records = 1000;
 
         Bucket bucket = cluster.bucket(bucketName);
         bucket.waitUntilReady(Duration.parse("PT10S"));
         Collection collection = bucket.scope("sample").collection("first_collection");
 
-        (new Thread(() -> {
-            loadData(mapper, "pre2", records, collection);
-        })).start();
         long loadTime = loadData(mapper, "pre1", records, collection);
         sleep(1000);
 
@@ -109,16 +103,21 @@ public class ElixirDemoWorkload {
         cluster.disconnect();
     }
 
-    private static long loadData(ObjectMapper mapper, String prefix, int records, Collection collection) {
+    private static long loadData(ObjectMapper mapper, String prefix, int records, Collection collection) throws InterruptedException {
         long start = System.currentTimeMillis();
         System.out.print("Loading data ...");
 
+        Semaphore semaphore = new Semaphore(20);
+        AsyncCollection async = collection.async();
+
         for (int cnt = 0; cnt < records; ++cnt) {
             ObjectNode jsonValue = createObjectNode(mapper, prefix, 2, 10, 1);
-            MutationResult upsertResult = collection.upsert(cntToKey(prefix, cnt), jsonValue);
-            if (debug) System.err.println(upsertResult);
+            semaphore.acquire();
+            async.upsert(cntToKey(prefix, cnt), jsonValue).thenRun(semaphore::release);
         }
+        semaphore.acquire(20);
 
+        // key and values
         long loaded = System.currentTimeMillis();
         long loadTime = (loaded - start) / 1000;
         System.out.println("done. " + records + " records loaded (" + loadTime + "s)");
