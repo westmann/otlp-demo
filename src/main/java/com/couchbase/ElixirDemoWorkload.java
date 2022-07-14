@@ -92,22 +92,30 @@ public class ElixirDemoWorkload {
         bucket.waitUntilReady(Duration.parse("PT10S"));
         Collection collection = bucket.scope("sample").collection("first_collection");
 
-        long loadTime = loadData(mapper, records, collection);
+        (new Thread(() -> {
+            loadData(mapper, "pre2", records, collection);
+        })).start();
+        long loadTime = loadData(mapper, "pre1", records, collection);
         sleep(1000);
-        readData(records, collection, loadTime);
+
+        (new Thread(() -> {
+            readData(records, "pre2", collection);
+        })).start();
+        readData(records, "pre1", collection);
         sleep(1000);
+
         queryData(cluster);
         sleep(1000);
         cluster.disconnect();
     }
 
-    private static long loadData(ObjectMapper mapper, int records, Collection collection) {
+    private static long loadData(ObjectMapper mapper, String prefix, int records, Collection collection) {
         long start = System.currentTimeMillis();
         System.out.print("Loading data ...");
 
         for (int cnt = 0; cnt < records; ++cnt) {
-            ObjectNode jsonValue = createObjectNode(mapper, "pre", 2, 3, 2);
-            MutationResult upsertResult = collection.upsert(cntToKey(cnt), jsonValue);
+            ObjectNode jsonValue = createObjectNode(mapper, prefix, 2, 10, 1);
+            MutationResult upsertResult = collection.upsert(cntToKey(prefix, cnt), jsonValue);
             if (debug) System.err.println(upsertResult);
         }
 
@@ -117,16 +125,17 @@ public class ElixirDemoWorkload {
         return loaded;
     }
 
-    private static void readData(int records, Collection collection, long loadTime) {
+    private static void readData(int records, String prefix, Collection collection) {
+        long start = System.currentTimeMillis();
         System.out.print("Reading data ... ");
 
         for (int cnt = 0; cnt < records; ++cnt) {
-            GetResult getResult = collection.get(cntToKey(cnt));
+            GetResult getResult = collection.get(cntToKey(prefix, cnt));
             getResult.contentAsObject().getString("name");
         }
 
         long read = System.currentTimeMillis();
-        long readTime = (read - loadTime) / 1000;
+        long readTime = (read - start) / 1000;
         System.out.println("done. " + records + " records read (" + readTime + "s)");
     }
 
@@ -148,8 +157,8 @@ public class ElixirDemoWorkload {
         System.out.println("Query Result:\n" + result.rowsAsObject());
     }
 
-    private static String cntToKey(int i) {
-        return "key-" + i;
+    private static String cntToKey(String prefix, int i) {
+        return prefix + "-key-" + i;
     }
 
     private static ObjectNode createObjectNode(ObjectMapper mapper, String prefix, int width, int length, int depth) {
