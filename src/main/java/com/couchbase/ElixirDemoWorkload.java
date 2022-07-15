@@ -1,11 +1,16 @@
 package com.couchbase;
 
 import com.couchbase.client.core.cnc.RequestTracer;
+import com.couchbase.client.core.deps.com.fasterxml.jackson.core.JsonProcessingException;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMapper;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.node.ObjectNode;
 import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.node.TextNode;
 import com.couchbase.client.core.env.SeedNode;
-import com.couchbase.client.java.*;
+import com.couchbase.client.java.AsyncCollection;
+import com.couchbase.client.java.Bucket;
+import com.couchbase.client.java.Cluster;
+import com.couchbase.client.java.ClusterOptions;
+import com.couchbase.client.java.Collection;
 import com.couchbase.client.java.env.ClusterEnvironment;
 import com.couchbase.client.java.kv.GetResult;
 import com.couchbase.client.java.query.QueryResult;
@@ -23,21 +28,27 @@ import org.apache.commons.lang3.RandomStringUtils;
 
 import java.time.Duration;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Semaphore;
+import java.util.stream.IntStream;
 
 import static java.lang.Thread.sleep;
 
 public class ElixirDemoWorkload {
 
+    public static final String SCOPE_NAME = "sample";
+    public static final String COLLECTION_NAME = "first_collection";
+
     static String connectionString = "127.0.0.1";
     static String username = "Administrator";
     static String password = "password";
-    static String bucketName = "some_bucket";
+    static String [] bucketNames = new String [] { "tenant-1", "tenant-2", "tenant-3"};
 
     static boolean debug = false;
 
-    public static void main(String[] args) throws InterruptedException {
+    public static void main(String[] args) throws InterruptedException, JsonProcessingException {
         SdkTracerProviderBuilder builder = SdkTracerProvider.builder().setSampler(Sampler.alwaysOn());
 
         builder.addSpanProcessor(BatchSpanProcessor.builder(OtlpGrpcSpanExporter.builder()
@@ -80,47 +91,74 @@ public class ElixirDemoWorkload {
         sleep(1000);
     }
 
-    private static void runWorkload(Cluster cluster) throws InterruptedException {
+    private static void runWorkload(Cluster cluster) throws InterruptedException, JsonProcessingException {
         ObjectMapper mapper = new ObjectMapper();
 
         final int records = 1000;
+        final int tenants = 3;
+        final int loops = 300;
+        final int concurrency = 20;
 
-        Bucket bucket = cluster.bucket(bucketName);
-        bucket.waitUntilReady(Duration.parse("PT10S"));
-        Collection collection = bucket.scope("sample").collection("first_collection");
-
-        long loadTime = loadData(mapper, "pre1", records, collection);
+        Map<String,String> data = generateData(mapper, "pre1", records);
+        loadData(cluster, data, tenants, loops, concurrency);
         sleep(1000);
 
-        (new Thread(() -> {
-            readData(records, "pre2", collection);
-        })).start();
-        readData(records, "pre1", collection);
-        sleep(1000);
+        //(new Thread(() -> {
+        //    readData(records, "pre2", collection);
+        //})).start();
+        //readData(records, "pre1", collection);
+        //sleep(1000);
 
         queryData(cluster);
         sleep(1000);
         cluster.disconnect();
     }
 
-    private static long loadData(ObjectMapper mapper, String prefix, int records, Collection collection) throws InterruptedException {
-        long start = System.currentTimeMillis();
-        System.out.print("Loading data ...");
-
-        Semaphore semaphore = new Semaphore(20);
-        AsyncCollection async = collection.async();
+    private static Map<String,String> generateData(ObjectMapper mapper, String prefix, int records) throws JsonProcessingException {
+        System.out.print("Generating " + records + " records of data ...");
+        Map<String,String> data = new HashMap<>();
 
         for (int cnt = 0; cnt < records; ++cnt) {
             ObjectNode jsonValue = createObjectNode(mapper, prefix, 2, 10, 1);
-            semaphore.acquire();
-            async.upsert(cntToKey(prefix, cnt), jsonValue).thenRun(semaphore::release);
+            data.put(cntToKey(prefix, cnt), mapper.writer().writeValueAsString(jsonValue));
         }
-        semaphore.acquire(20);
+        return data;
+    }
 
-        // key and values
+    private static long loadData(Cluster cluster, Map<String, String> data, int tenants, int loops, int concurrency) throws InterruptedException {
+
+        long start = System.currentTimeMillis();
+        System.out.print("Loading data ...");
+
+        IntStream.range(0, tenants).parallel().forEach(tenant -> {
+            try {
+                Bucket bucket = cluster.bucket(bucketNames[tenant]);
+                bucket.waitUntilReady(Duration.parse("PT10S"));
+                Collection collection = bucket.scope(SCOPE_NAME).collection(COLLECTION_NAME);
+                Semaphore semaphore = new Semaphore(concurrency);
+                AsyncCollection async = collection.async();
+                for (int i = 0; i < loops; i++) {
+                    for (Map.Entry<String, String> entry : data.entrySet()) {
+                        semaphore.acquire();
+                        async.upsert(entry.getKey(), entry.getValue()).whenComplete((r, e) -> {
+                            try {
+                                if (e != null) {
+                                    e.printStackTrace();
+                                }
+                            } finally {
+                                semaphore.release();
+                            }
+                        });
+                    }
+                }
+                semaphore.acquire(concurrency);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
         long loaded = System.currentTimeMillis();
         long loadTime = (loaded - start) / 1000;
-        System.out.println("done. " + records + " records loaded (" + loadTime + "s)");
+        System.out.println("done. " + loops + " loops upserting " + data.size() + " records into " + tenants + " tenants (" + loadTime + "s)");
         return loaded;
     }
 
